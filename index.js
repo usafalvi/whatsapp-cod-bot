@@ -9,15 +9,17 @@ const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
-const DATABASE_URL = process.env.DATABASE_URL;
 
-// PostgreSQL connection pool (ssl: false for internal Docker network)
+// Clean DATABASE_URL by stripping any query params to prevent SSL enforcements
+const rawDbUrl = (process.env.DATABASE_URL || '').split('?')[0];
+
+// Initialize PostgreSQL pool for local Docker network
 const pool = new Pool({
-  connectionString: DATABASE_URL,
+  connectionString: rawDbUrl,
   ssl: false
 });
 
-// Initialize database table on startup
+// Initialize database table on server startup
 async function initDb() {
   try {
     await pool.query(`
@@ -38,7 +40,7 @@ async function initDb() {
 }
 initDb();
 
-// 1. Webhook Verification Endpoint (GET request from Meta)
+// 1. Meta Webhook Verification Endpoint (GET)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -59,7 +61,7 @@ app.get('/webhook', (req, res) => {
   return res.status(400).send('Missing hub parameters');
 });
 
-// 2. Incoming WhatsApp Message Handler (POST request from Meta)
+// 2. Incoming WhatsApp Message Handler (POST)
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
@@ -71,10 +73,10 @@ app.post('/webhook', async (req, res) => {
       const message = value?.messages?.[0];
 
       if (message) {
-        const from = message.from; // Customer's phone number
+        const from = message.from; // Customer phone number
         console.log(`Incoming message from ${from}`);
 
-        // Handle Interactive Button Responses
+        // Handle Interactive Button Replies
         if (message.type === 'interactive') {
           const buttonId = message.interactive.button_reply.id;
           console.log(`User clicked button: ${buttonId}`);
@@ -101,7 +103,7 @@ app.post('/webhook', async (req, res) => {
             );
           }
         } 
-        // Handle Plain Text Responses
+        // Handle Standard Text Messages
         else if (message.type === 'text') {
           const text = message.text.body;
           console.log(`User text: ${text}`);
@@ -129,12 +131,94 @@ app.post('/api/shopify-order', async (req, res) => {
       return res.status(400).json({ error: 'Missing order_id or phone_number' });
     }
 
-    // Format phone number to international E.164 format (e.g., 03351234567 -> 923351234567)
+    // Format phone number to E.164 format (e.g., 03351234567 -> 923351234567)
     let cleanPhone = phone_number.replace(/[^0-9]/g, '');
     if (cleanPhone.startsWith('0')) {
       cleanPhone = '92' + cleanPhone.substring(1);
     }
 
-    // Save order in PostgreSQL database
+    // Insert order into PostgreSQL
     await pool.query(
-      `INSERT INTO cod_orders (order_id, customer_name, phone_number, total_amount,
+      `INSERT INTO cod_orders (order_id, customer_name, phone_number, total_amount, status)
+       VALUES ($1, $2, $3, $4, 'PENDING')
+       ON CONFLICT (order_id) DO NOTHING;`,
+      [order_id, customer_name || 'Customer', cleanPhone, total_amount || '0']
+    );
+
+    // Send WhatsApp Interactive Confirmation Message
+    await sendInteractiveCODMessage(cleanPhone, customer_name, order_id, total_amount);
+
+    return res.status(200).json({ success: true, message: 'COD confirmation sent.' });
+  } catch (error) {
+    console.error('Error processing order:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Helper: Send Interactive WhatsApp Message with Buttons
+async function sendInteractiveCODMessage(toPhone, customerName, orderId, totalAmount) {
+  const url = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`;
+  
+  const payload = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: toPhone,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      header: {
+        type: 'text',
+        text: '🛍️ Order Confirmation'
+      },
+      body: {
+        text: `Hi ${customerName || 'there'}! 👋\n\nThank you for shopping with us! We received your Cash on Delivery order:\n\n📦 Order ID: #${orderId}\n💰 Amount: Rs. ${totalAmount}\n\nPlease click below to confirm your delivery:`
+      },
+      action: {
+        buttons: [
+          {
+            type: 'reply',
+            reply: {
+              id: `CONFIRM_${orderId}`,
+              title: '✅ Confirm Order'
+            }
+          },
+          {
+            type: 'reply',
+            reply: {
+              id: `CANCEL_${orderId}`,
+              title: '❌ Cancel Order'
+            }
+          }
+        ]
+      }
+    }
+  };
+
+  await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
+// Helper: Send Plain Text WhatsApp Message
+async function sendWhatsAppText(toPhone, text) {
+  const url = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`;
+  
+  await axios.post(url, {
+    messaging_product: 'whatsapp',
+    to: toPhone,
+    type: 'text',
+    text: { body: text }
+  }, {
+    headers: {
+      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
+app.listen(PORT, () => {
+  console.log(`WhatsApp COD Bot Engine listening on port ${PORT}`);
+});
