@@ -10,7 +10,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
 
-// Clean DATABASE_URL by stripping query params
+// Clean DATABASE_URL by stripping query parameters to prevent SSL enforcement
 const rawDbUrl = (process.env.DATABASE_URL || '').split('?')[0];
 
 const pool = new Pool({
@@ -73,7 +73,7 @@ app.post('/webhook', async (req, res) => {
       const message = value?.messages?.[0];
 
       if (message) {
-        const from = message.from; // Customer phone number exactly as sent by Meta
+        const from = message.from; // Customer phone number as sent by Meta
         console.log(`Incoming message from ${from}`);
 
         // Handle Interactive Button Replies
@@ -203,22 +203,30 @@ async function sendInteractiveCODMessage(toPhone, customerName, orderId, totalAm
   });
 }
 
-// Helper: Send Plain Text WhatsApp Message
+// Helper: Send Plain Text WhatsApp Message (Safely Handles Unregistered Test Numbers)
 async function sendWhatsAppText(toPhone, text) {
   const url = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`;
   
-  await axios.post(url, {
-    messaging_product: 'whatsapp',
-    recipient_type: 'individual',
-    to: toPhone,
-    type: 'text',
-    text: { body: text }
-  }, {
-    headers: {
-      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
-      'Content-Type': 'application/json'
-    }
-  });
+  try {
+    await axios.post(url, {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: toPhone,
+      type: 'text',
+      text: { body: text }
+    }, {
+      headers: {
+        Authorization: `Bearer ${META_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    console.log(`Successfully sent reply message to ${toPhone}`);
+  } catch (error) {
+    console.error(
+      `Could not send reply message to ${toPhone}:`,
+      error.response?.data?.error?.message || error.message
+    );
+  }
 }
 
 app.listen(PORT, () => {
