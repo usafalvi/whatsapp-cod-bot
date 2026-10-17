@@ -11,10 +11,10 @@ const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-// PostgreSQL connection pool
+// PostgreSQL connection pool (ssl: false for internal Docker network)
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL && DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+  ssl: false
 });
 
 // Initialize database table on startup
@@ -38,24 +38,28 @@ async function initDb() {
 }
 initDb();
 
-// 1. Webhook Verification Endpoint (GET)
+// 1. Webhook Verification Endpoint (GET request from Meta)
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+
+  console.log('GET /webhook ping received');
+  console.log(`Received Token: "${token}" | Expected Token: "${VERIFY_TOKEN}"`);
 
   if (mode && token) {
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
       console.log('WEBHOOK_VERIFIED_SUCCESSFULLY');
       return res.status(200).send(challenge);
     } else {
+      console.log('TOKEN_MISMATCH_OR_INVALID_MODE');
       return res.sendStatus(403);
     }
   }
   return res.status(400).send('Missing hub parameters');
 });
 
-// 2. Incoming WhatsApp Message Handler (POST)
+// 2. Incoming WhatsApp Message Handler (POST request from Meta)
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
@@ -81,21 +85,30 @@ app.post('/webhook', async (req, res) => {
               "UPDATE cod_orders SET status = 'CONFIRMED' WHERE order_id = $1",
               [orderId]
             );
-            await sendWhatsAppText(from, `✅ Thank you! Your Order #${orderId} has been CONFIRMED. We are preparing it for shipment.`);
+            await sendWhatsAppText(
+              from, 
+              `✅ Thank you! Your Order #${orderId} has been CONFIRMED. We are preparing it for shipment.`
+            );
           } else if (buttonId.startsWith('CANCEL_')) {
             const orderId = buttonId.replace('CANCEL_', '');
             await pool.query(
               "UPDATE cod_orders SET status = 'CANCELLED' WHERE order_id = $1",
               [orderId]
             );
-            await sendWhatsAppText(from, `❌ Order #${orderId} has been CANCELLED. Thank you for letting us know.`);
+            await sendWhatsAppText(
+              from, 
+              `❌ Order #${orderId} has been CANCELLED. Thank you for letting us know.`
+            );
           }
         } 
         // Handle Plain Text Responses
         else if (message.type === 'text') {
           const text = message.text.body;
           console.log(`User text: ${text}`);
-          await sendWhatsAppText(from, `Hi! To manage your order, please click the button on your confirmation message or reply with your Order ID.`);
+          await sendWhatsAppText(
+            from, 
+            `Hi! To manage your order, please click the button on your confirmation message or reply with your Order ID.`
+          );
         }
       }
     }
@@ -107,8 +120,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// 3. Shopify Order Trigger Endpoint (POST)
-// Called when a new COD order is created in Shopify or WooCommerce
+// 3. Shopify / WooCommerce Order Trigger Endpoint (POST)
 app.post('/api/shopify-order', async (req, res) => {
   try {
     const { order_id, customer_name, phone_number, total_amount } = req.body;
@@ -117,7 +129,7 @@ app.post('/api/shopify-order', async (req, res) => {
       return res.status(400).json({ error: 'Missing order_id or phone_number' });
     }
 
-    // Format phone number to international E.164 (e.g. 03351234567 -> 923351234567)
+    // Format phone number to international E.164 format (e.g., 03351234567 -> 923351234567)
     let cleanPhone = phone_number.replace(/[^0-9]/g, '');
     if (cleanPhone.startsWith('0')) {
       cleanPhone = '92' + cleanPhone.substring(1);
@@ -125,86 +137,4 @@ app.post('/api/shopify-order', async (req, res) => {
 
     // Save order in PostgreSQL database
     await pool.query(
-      `INSERT INTO cod_orders (order_id, customer_name, phone_number, total_amount, status)
-       VALUES ($1, $2, $3, $4, 'PENDING')
-       ON CONFLICT (order_id) DO NOTHING;`,
-      [order_id, customer_name || 'Customer', cleanPhone, total_amount || '0']
-    );
-
-    // Send Interactive Confirmation Message via WhatsApp
-    await sendInteractiveCODMessage(cleanPhone, customer_name, order_id, total_amount);
-
-    return res.status(200).json({ success: true, message: 'COD confirmation sent.' });
-  } catch (error) {
-    console.error('Error processing order:', error.message);
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// Helper: Send Interactive WhatsApp Message with Confirm/Cancel Buttons
-async function sendInteractiveCODMessage(toPhone, customerName, orderId, totalAmount) {
-  const url = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`;
-  
-  const payload = {
-    messaging_product: 'whatsapp',
-    recipient_type: 'individual',
-    to: toPhone,
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      header: {
-        type: 'text',
-        text: '🛍️ Order Confirmation'
-      },
-      body: {
-        text: `Hi ${customerName || 'there'}! 👋\n\nThank you for shopping with us! We received your Cash on Delivery order:\n\n📦 Order ID: #${orderId}\n💰 Amount: Rs. ${totalAmount}\n\nPlease click below to confirm your delivery:`
-      },
-      action: {
-        buttons: [
-          {
-            type: 'reply',
-            reply: {
-              id: `CONFIRM_${orderId}`,
-              title: '✅ Confirm Order'
-            }
-          },
-          {
-            type: 'reply',
-            reply: {
-              id: `CANCEL_${orderId}`,
-              title: '❌ Cancel Order'
-            }
-          }
-        ]
-      }
-    }
-  };
-
-  await axios.post(url, payload, {
-    headers: {
-      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
-      'Content-Type': 'application/json'
-    }
-  });
-}
-
-// Helper: Send Simple Text Message
-async function sendWhatsAppText(toPhone, text) {
-  const url = `https://graph.facebook.com/v20.0/${META_PHONE_NUMBER_ID}/messages`;
-  
-  await axios.post(url, {
-    messaging_product: 'whatsapp',
-    to: toPhone,
-    type: 'text',
-    text: { body: text }
-  }, {
-    headers: {
-      Authorization: `Bearer ${META_ACCESS_TOKEN}`,
-      'Content-Type': 'application/json'
-    }
-  });
-}
-
-app.listen(PORT, () => {
-  console.log(`WhatsApp COD Bot Engine listening on port ${PORT}`);
-});
+      `INSERT INTO cod_orders (order_id, customer_name, phone_number, total_amount,
