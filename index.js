@@ -10,16 +10,15 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
 
-// Clean DATABASE_URL by stripping any query params to prevent SSL enforcements
+// Clean DATABASE_URL by stripping query params
 const rawDbUrl = (process.env.DATABASE_URL || '').split('?')[0];
 
-// Initialize PostgreSQL pool for local Docker network
 const pool = new Pool({
   connectionString: rawDbUrl,
   ssl: false
 });
 
-// Initialize database table on server startup
+// Initialize database table on startup
 async function initDb() {
   try {
     await pool.query(`
@@ -47,14 +46,12 @@ app.get('/webhook', (req, res) => {
   const challenge = req.query['hub.challenge'];
 
   console.log('GET /webhook ping received');
-  console.log(`Received Token: "${token}" | Expected Token: "${VERIFY_TOKEN}"`);
 
   if (mode && token) {
     if (mode === 'subscribe' && token === VERIFY_TOKEN) {
       console.log('WEBHOOK_VERIFIED_SUCCESSFULLY');
       return res.status(200).send(challenge);
     } else {
-      console.log('TOKEN_MISMATCH_OR_INVALID_MODE');
       return res.sendStatus(403);
     }
   }
@@ -63,6 +60,9 @@ app.get('/webhook', (req, res) => {
 
 // 2. Incoming WhatsApp Message Handler (POST)
 app.post('/webhook', async (req, res) => {
+  // Acknowledge Meta immediately to prevent webhook retry timeouts
+  res.sendStatus(200);
+
   try {
     const body = req.body;
 
@@ -73,7 +73,7 @@ app.post('/webhook', async (req, res) => {
       const message = value?.messages?.[0];
 
       if (message) {
-        const from = message.from; // Customer phone number
+        const from = message.from; // Customer phone number exactly as sent by Meta
         console.log(`Incoming message from ${from}`);
 
         // Handle Interactive Button Replies
@@ -87,6 +87,8 @@ app.post('/webhook', async (req, res) => {
               "UPDATE cod_orders SET status = 'CONFIRMED' WHERE order_id = $1",
               [orderId]
             );
+            console.log(`Order #${orderId} marked as CONFIRMED in database.`);
+
             await sendWhatsAppText(
               from, 
               `✅ Thank you! Your Order #${orderId} has been CONFIRMED. We are preparing it for shipment.`
@@ -97,28 +99,27 @@ app.post('/webhook', async (req, res) => {
               "UPDATE cod_orders SET status = 'CANCELLED' WHERE order_id = $1",
               [orderId]
             );
+            console.log(`Order #${orderId} marked as CANCELLED in database.`);
+
             await sendWhatsAppText(
               from, 
               `❌ Order #${orderId} has been CANCELLED. Thank you for letting us know.`
             );
           }
         } 
-        // Handle Standard Text Messages
+        // Handle Plain Text Messages
         else if (message.type === 'text') {
           const text = message.text.body;
           console.log(`User text: ${text}`);
           await sendWhatsAppText(
             from, 
-            `Hi! To manage your order, please click the button on your confirmation message or reply with your Order ID.`
+            `Hi! To manage your order, please click the button on your confirmation message.`
           );
         }
       }
     }
-
-    return res.sendStatus(200);
   } catch (error) {
-    console.error('Error handling WhatsApp webhook:', error.message);
-    return res.sendStatus(200);
+    console.error('Error handling WhatsApp webhook:', error.response?.data || error.message);
   }
 });
 
@@ -131,7 +132,7 @@ app.post('/api/shopify-order', async (req, res) => {
       return res.status(400).json({ error: 'Missing order_id or phone_number' });
     }
 
-    // Format phone number to E.164 format (e.g., 03351234567 -> 923351234567)
+    // Format phone number to clean E.164 digits without leading + or 0
     let cleanPhone = phone_number.replace(/[^0-9]/g, '');
     if (cleanPhone.startsWith('0')) {
       cleanPhone = '92' + cleanPhone.substring(1);
@@ -141,7 +142,7 @@ app.post('/api/shopify-order', async (req, res) => {
     await pool.query(
       `INSERT INTO cod_orders (order_id, customer_name, phone_number, total_amount, status)
        VALUES ($1, $2, $3, $4, 'PENDING')
-       ON CONFLICT (order_id) DO NOTHING;`,
+       ON CONFLICT (order_id) DO UPDATE SET phone_number = EXCLUDED.phone_number;`,
       [order_id, customer_name || 'Customer', cleanPhone, total_amount || '0']
     );
 
@@ -150,8 +151,8 @@ app.post('/api/shopify-order', async (req, res) => {
 
     return res.status(200).json({ success: true, message: 'COD confirmation sent.' });
   } catch (error) {
-    console.error('Error processing order:', error.message);
-    return res.status(500).json({ error: error.message });
+    console.error('Error processing order:', error.response?.data || error.message);
+    return res.status(500).json({ error: error.response?.data || error.message });
   }
 });
 
@@ -208,6 +209,7 @@ async function sendWhatsAppText(toPhone, text) {
   
   await axios.post(url, {
     messaging_product: 'whatsapp',
+    recipient_type: 'individual',
     to: toPhone,
     type: 'text',
     text: { body: text }
