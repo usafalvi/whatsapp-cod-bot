@@ -7,24 +7,30 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 
 // Webhook verification endpoint (GET request from Meta)
 app.get('/webhook', (req, res) => {
-    let mode = req.query['hub.mode'];
-    let token = req.query['hub.verify_token'];
-    let challenge = req.query['hub.challenge'];
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    console.log('GET /webhook ping received');
+    console.log(`Received Token: "${token}" | Expected Token: "${VERIFY_TOKEN}"`);
 
     if (mode && token) {
         if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-            console.log('WEBHOOK_VERIFIED');
-            res.status(200).send(challenge);
+            console.log('WEBHOOK_VERIFIED_SUCCESSFULLY');
+            return res.status(200).send(challenge);
         } else {
-            res.sendStatus(403);
+            console.log('TOKEN_MISMATCH_OR_INVALID_MODE');
+            return res.sendStatus(403);
         }
     }
+
+    return res.status(400).send('Missing hub parameters');
 });
 
 // Incoming message receiver (POST request from Meta)
 app.post('/webhook', (req, res) => {
     console.log('Incoming webhook message received');
-    res.sendStatus(200);
+    return res.sendStatus(200);
 });
 
 app.listen(PORT, () => {
